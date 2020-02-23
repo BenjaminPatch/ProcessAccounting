@@ -1,0 +1,254 @@
+? dev/acct.c
+Index: arch/amd64/amd64/conf.c
+===================================================================
+RCS file: /cvs/src/sys/arch/amd64/amd64/conf.c,v
+retrieving revision 1.63
+diff -u -p -r1.63 conf.c
+--- arch/amd64/amd64/conf.c	31 Aug 2018 04:20:37 -0000	1.63
++++ arch/amd64/amd64/conf.c	5 Sep 2019 00:02:57 -0000
+@@ -116,6 +116,7 @@ int	nblkdev = nitems(bdevsw);
+ #define	mmwrite	mmrw
+ cdev_decl(mm);
+ cdev_decl(wd);
++#include "acct.h"
+ #include "bio.h"
+ #include "pty.h"
+ #include "com.h"
+@@ -212,7 +213,7 @@ struct cdevsw	cdevsw[] =
+ 	cdev_notdef(),			/* 21 */
+ 	cdev_fd_init(1,filedesc),	/* 22: file descriptor pseudo-device */
+ 	cdev_bpf_init(NBPFILTER,bpf),	/* 23: Berkeley packet filter */
+-	cdev_notdef(),			/* 24 */
++	cdev_acct_init(NACCT,acct),	/* 24: process accounting */
+ #if 0
+ 	cdev_ocis_init(NPCMCIA,pcmcia), /* 25: PCMCIA Bus */
+ #else
+Index: conf/GENERIC
+===================================================================
+RCS file: /cvs/src/sys/conf/GENERIC,v
+retrieving revision 1.264
+diff -u -p -r1.264 GENERIC
+--- conf/GENERIC	1 Aug 2019 03:06:59 -0000	1.264
++++ conf/GENERIC	5 Sep 2019 00:02:58 -0000
+@@ -112,5 +112,6 @@ pseudo-device	switch		# Switch
+ pseudo-device	bio	1	# ioctl multiplexing device
+ 
+ pseudo-device	fuse		# fuse device
++pseudo-device	acct		# process accounting device
+ 
+ option		BOOT_CONFIG	# add support for boot -c
+Index: conf/files
+===================================================================
+RCS file: /cvs/src/sys/conf/files,v
+retrieving revision 1.673
+diff -u -p -r1.673 files
+--- conf/files	1 Aug 2019 03:06:35 -0000	1.673
++++ conf/files	5 Sep 2019 00:02:58 -0000
+@@ -617,6 +617,9 @@ file 	net/if_pppoe.c			pppoe	needs-flag
+ pseudo-device kcov
+ file	dev/kcov.c			kcov	needs-flag
+ 
++pseudo-device acct
++file	dev/acct.c			acct	needs-flag
++
+ # XXX machine-independent SCSI files should live somewhere here, maybe
+ 
+ # kernel sources
+Index: dev/acct.h
+===================================================================
+RCS file: dev/acct.h
+diff -N dev/acct.h
+--- /dev/null	1 Jan 1970 00:00:00 -0000
++++ dev/acct.h	5 Sep 2019 00:02:58 -0000
+@@ -0,0 +1,73 @@
++/*	$OpenBSD$ */
++
++/*
++ * Copyright (c) 2018, 2019 The University of Queensland
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#ifndef __DEV_ACCT_H__
++#define __DEV_ACCT_H__
++
++#define ACCT_MSG_FORK	0
++#define ACCT_MSG_EXEC	1
++#define ACCT_MSG_EXIT	2
++
++struct acct_common {
++	unsigned short		ac_type;
++	unsigned short		ac_len;
++	unsigned int		ac_seq;
++
++	char			ac_comm[16];	/* command name */
++	struct timespec		ac_etime;	/* elapsed time */
++	struct timespec		ac_btime;	/* starting time */
++	pid_t			ac_pid;		/* process id */
++	uid_t			ac_uid;		/* user id */
++	gid_t			ac_gid;		/* group id */
++	dev_t			ac_tty;		/* controlling tty */
++	unsigned int		ac_flag;	/* accounting flags */
++};
++
++/*
++ * fork info is mostly from the parent, but acct_fork gets passed the child.
++ */
++struct acct_fork {
++	struct acct_common	ac_common;
++	pid_t			ac_cpid;	/* child pid */
++};
++
++/*
++ * exec exists mostly to show the new command name.
++ */
++struct acct_exec {
++	struct acct_common	ac_common;
++};
++
++/*
++ * basically a clone of the ACCOUNTING syscall
++ */
++struct acct_exit {
++	struct acct_common	ac_common;
++	struct timespec		ac_utime;	/* user time */
++	struct timespec		ac_stime;	/* system time */
++	uint64_t		ac_mem;		/* average memory usage */
++	uint64_t		ac_io;		/* count of IO blocks */
++};
++
++#ifdef _KERNEL
++void	acct_fork(struct process *);
++void	acct_exec(struct process *);
++void	acct_exit(struct process *);
++#endif /* _KERNEL */
++
++#endif /* __DEV_ACCT_H__ */
+Index: kern/kern_exec.c
+===================================================================
+RCS file: /cvs/src/sys/kern/kern_exec.c,v
+retrieving revision 1.208
+diff -u -p -r1.208 kern_exec.c
+--- kern/kern_exec.c	2 Aug 2019 02:17:35 -0000	1.208
++++ kern/kern_exec.c	5 Sep 2019 00:02:58 -0000
+@@ -64,6 +64,11 @@
+ #include <uvm/uvm_extern.h>
+ #include <machine/tcb.h>
+ 
++#include "acct.h"
++#if NACCT > 0
++#include <dev/acct.h>
++#endif
++
+ void	unveil_destroy(struct process *ps);
+ 
+ const struct kmem_va_mode kv_exec = {
+@@ -673,6 +678,10 @@ sys_execve(struct proc *p, void *v, regi
+ 	 * notify others that we exec'd
+ 	 */
+ 	KNOTE(&pr->ps_klist, NOTE_EXEC);
++
++#if NACCT > 0
++	acct_exec(pr);
++#endif
+ 
+ 	/* setup new registers and do misc. setup. */
+ 	if (pack.ep_emul->e_fixup != NULL) {
+Index: kern/kern_exit.c
+===================================================================
+RCS file: /cvs/src/sys/kern/kern_exit.c,v
+retrieving revision 1.178
+diff -u -p -r1.178 kern_exit.c
+--- kern/kern_exit.c	21 Jun 2019 09:39:48 -0000	1.178
++++ kern/kern_exit.c	5 Sep 2019 00:02:58 -0000
+@@ -70,6 +70,11 @@
+ 
+ #include <uvm/uvm_extern.h>
+ 
++#include "acct.h"
++#if NACCT > 0
++#include <dev/acct.h>
++#endif
++
+ #include "kcov.h"
+ #if NKCOV > 0
+ #include <sys/kcov.h>
+@@ -199,6 +204,9 @@ exit1(struct proc *p, int rv, int flags)
+ 		semexit(pr);
+ #endif
+ 		killjobc(pr);
++#if NACCT > 0
++		acct_exit(pr);
++#endif
+ #ifdef ACCOUNTING
+ 		acct_process(p);
+ #endif
+Index: kern/kern_fork.c
+===================================================================
+RCS file: /cvs/src/sys/kern/kern_fork.c,v
+retrieving revision 1.213
+diff -u -p -r1.213 kern_fork.c
+--- kern/kern_fork.c	21 Jun 2019 09:39:48 -0000	1.213
++++ kern/kern_fork.c	5 Sep 2019 00:02:58 -0000
+@@ -67,6 +67,11 @@
+ 
+ #include "kcov.h"
+ 
++#include "acct.h"
++#if NACCT > 0
++#include <dev/acct.h>
++#endif
++
+ int	nprocesses = 1;		/* process 0 */
+ int	nthreads = 1;		/* proc 0 */
+ int	randompid;		/* when set to 1, pid's go random */
+@@ -484,6 +489,10 @@ fork1(struct proc *curp, int flags, void
+ 	 * Notify any interested parties about the new process.
+ 	 */
+ 	KNOTE(&curpr->ps_klist, NOTE_FORK | pr->ps_pid);
++
++#if NACCT > 0
++	acct_fork(pr);
++#endif
+ 
+ 	/*
+ 	 * Update stats now that we know the fork was successful.
+Index: sys/conf.h
+===================================================================
+RCS file: /cvs/src/sys/sys/conf.h,v
+retrieving revision 1.145
+diff -u -p -r1.145 conf.h
+--- sys/conf.h	31 Aug 2018 04:20:37 -0000	1.145
++++ sys/conf.h	5 Sep 2019 00:02:58 -0000
+@@ -482,6 +482,13 @@ extern struct cdevsw cdevsw[];
+ 	(dev_type_stop((*))) enodev, 0, selfalse, \
+ 	(dev_init(c,n,mmap)), 0, D_CLONE }
+ 
++/* open, close, read, write, ioctl, poll, kqfilter */
++#define cdev_acct_init(c,n) { \
++	dev_init(c,n,open), dev_init(c,n,close), dev_init(c,n,read), \
++	dev_init(c,n,write), dev_init(c,n,ioctl), \
++	(dev_type_stop((*))) enodev, 0, dev_init(c,n,poll), \
++	(dev_type_mmap((*))) enodev, 0, 0, dev_init(c,n,kqfilter) }
++
+ #endif
+ 
+ /*
+@@ -615,6 +622,7 @@ cdev_decl(fuse);
+ cdev_decl(pvbus);
+ cdev_decl(ipmi);
+ cdev_decl(kcov);
++cdev_decl(acct);
+ 
+ #endif
+ 
